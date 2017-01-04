@@ -29,7 +29,8 @@ const (
 
 var (
 	fList    = flag.Bool("l", false, "list directives in packages")
-	fVerbose = flag.Bool("v", false, "log verbosely")
+	fVerbose = flag.Bool("v", false, "print the names of packages and files as they are processed")
+	fExecute = flag.Bool("x", false, "print commands as they are executed")
 	fUntyped = flag.String("untyped", "", "a list of untyped generators to run")
 	fTyped   = flag.String("typed", "", "a list of typed generators to run")
 
@@ -46,10 +47,6 @@ func main() {
 	pkgs := explodePkgList(flag.Args())
 	sort.Strings(pkgs)
 
-	if *fVerbose {
-		log.Printf("Working with the following packages:\n\t%v\n", strings.Join(pkgs, "\n\t"))
-	}
-
 	wpkgs := pkgs
 	diffs := computeStale(wpkgs)
 
@@ -57,9 +54,6 @@ func main() {
 	sort.Strings(dirs)
 
 	if len(dirs) == 0 {
-		if *fVerbose {
-			log.Printf("Nothing to do; no directives found")
-		}
 		os.Exit(0)
 	}
 
@@ -83,10 +77,7 @@ func main() {
 				log.Fatalf("Exceeded loop limit for untyped go generate cmd: %v\n", untypedRunExp)
 			}
 
-			if *fVerbose {
-				log.Printf("Untyped diffs: %v\n", diffs)
-			}
-
+			log.Printf("Untyped run %v\n", untypedCount)
 			goGenerate(diffs, untypedRunExp)
 			untypedCount++
 
@@ -95,16 +86,14 @@ func main() {
 
 		// TODO need this largely because of stringer
 		// https://github.com/golang/go/issues/10249
+		log.Printf("go install\n")
 		goInstall(wpkgs)
 
 		if typedCount > typedLoopLimit {
 			log.Fatalf("Exceeded loop limit for typed go generate cmd: %v\n", untypedRunExp)
 		}
 
-		if *fVerbose {
-			log.Printf("Typed diffs: %v\n", wpkgs)
-		}
-
+		log.Printf("Typed run %v\n", typedCount)
 		goGenerate(wpkgs, typedRunExp)
 		typedCount++
 
@@ -115,6 +104,7 @@ func main() {
 		}
 
 		wpkgs = diffs
+
 	}
 }
 
@@ -137,6 +127,8 @@ type Package struct {
 	Imports      []string
 	Deps         []string
 	Incomplete   bool
+	Error        *PackageError
+	DepsErrors   []*PackageError
 	TestGoFiles  []string
 	TestImports  []string
 	XTestGoFiles []string
@@ -145,19 +137,25 @@ type Package struct {
 	pkgHash string
 }
 
+type PackageError struct {
+	ImportStack []string
+	Pos         string
+	Err         string
+}
+
 func explodePkgList(pkgs []string) []string {
-	out, err := exec.Command("go", append([]string{"list"}, pkgs...)...).CombinedOutput()
+	out, err := exec.Command("go", append([]string{"list", "-e"}, pkgs...)...).CombinedOutput()
 	if err != nil {
-		log.Fatalf("go list: %v\n%s", err, out)
+		log.Fatalf("go list: %v\n", err)
 	}
 
 	return strings.Fields(string(out))
 }
 
 func readPkgs(pkgs []string) {
-	out, err := exec.Command("go", append([]string{"list", "-json"}, pkgs...)...).CombinedOutput()
+	out, err := exec.Command("go", append([]string{"list", "-e", "-json"}, pkgs...)...).CombinedOutput()
 	if err != nil {
-		log.Fatalf("go list: %v\n%s", err, out)
+		log.Fatalf("go list: %v\n", err)
 	}
 
 	dec := json.NewDecoder(bytes.NewReader(out))
@@ -169,6 +167,20 @@ func readPkgs(pkgs []string) {
 			}
 			log.Fatalf("reading go list output: %v", err)
 		}
+
+		if p.Incomplete {
+			// TODO this could probably be improved
+
+			errs := []interface{}{"Error in package ", p.ImportPath, "\n"}
+			if p.Error != nil {
+				errs = append(errs, p.Error.Err)
+			}
+			for _, e := range p.DepsErrors {
+				errs = append(errs, e.Err)
+			}
+			log.Fatal(errs...)
+		}
+
 		pkgInfo[p.ImportPath] = &p
 	}
 }
@@ -276,7 +288,7 @@ func validateCmds(dirs []string, untypedList, typedList string) ([]string, []str
 
 	for _, v := range ntcmds {
 		if _, ok := dmap[v]; !ok {
-			log.Printf("Directive provided but does not appear in any files: %q\n", v)
+			log.Fatalf("Directive provided but does not appear in any files: %q\n", v)
 		}
 
 		dmap[v] = true
@@ -285,7 +297,7 @@ func validateCmds(dirs []string, untypedList, typedList string) ([]string, []str
 
 	for _, v := range tcmds {
 		if _, ok := dmap[v]; !ok {
-			log.Printf("Directive provided but does not appear in any files: %v\n", v)
+			log.Fatalf("Directive provided but does not appear in any files: %v\n", v)
 		}
 
 		if _, ok := ntmap[v]; ok {
@@ -340,26 +352,49 @@ func buildGoGenRegex(parts []string) string {
 }
 
 func goGenerate(pkgs []string, runExp string) {
-	args := append([]string{"generate", "-run", runExp}, pkgs...)
+	args := []string{"generate"}
 
 	if *fVerbose {
-		log.Printf("go generate: go %v\n", strings.Join(args, " "))
+		args = append(args, "-v")
 	}
+
+	if *fExecute {
+		args = append(args, "-x")
+	}
+
+	args = append(args, "-run", runExp)
+
+	args = append(args, pkgs...)
 
 	out, err := exec.Command("go", args...).CombinedOutput()
 	if err != nil {
 		log.Fatalf("go generate: %v\n%s", err, out)
 	}
+
+	if len(out) > 0 {
+		fmt.Print(string(out))
+	}
 }
 
 func goInstall(pkgs []string) {
+	args := append([]string{"install"}, pkgs...)
 	// TODO is there anything better we can do than simply ignore the exit status of go install?
 	// because things are in a partial state
-	out, err := exec.Command("go", append([]string{"install"}, pkgs...)...).CombinedOutput()
+	out, _ := exec.Command("go", args...).CombinedOutput()
 
-	if *fVerbose {
-		log.Printf("go install: %v\n%s", err, out)
+	if *fExecute {
+		c := make([]interface{}, 1, len(args)+1)
 
+		c[0] = "go"
+
+		for _, v := range args {
+			c = append(c, v)
+		}
+
+		fmt.Println(c...)
+		if len(out) > 0 {
+			fmt.Printf(string(out))
+		}
 	}
 }
 
