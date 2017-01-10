@@ -8,11 +8,10 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha1"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -20,6 +19,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/myitcv/gogenerate"
 )
 
 const (
@@ -27,319 +28,151 @@ const (
 	typedLoopLimit   = 10
 )
 
-var (
-	fList    = flag.Bool("l", false, "list directives in packages")
-	fVerbose = flag.Bool("v", false, "print the names of packages and files as they are processed")
-	fExecute = flag.Bool("x", false, "print commands as they are executed")
-	fUntyped = flag.String("untyped", "", "a list of untyped generators to run")
-	fTyped   = flag.String("typed", "", "a list of typed generators to run")
+// All code basically derived from rsc.io/gt
 
-	pkgInfo = map[string]*Package{}
-)
+// TODO we effectively read from some files twice... whilst computing stale and scanning
+// for directives. These two operations could potentially be collapsed into a single read
 
-// Code basically derived from rsc.io/gt
 func main() {
 	log.SetFlags(0)
-	log.SetPrefix("gg: ")
+	log.SetPrefix("")
 
 	flag.Parse()
+
+	loadConfig()
 
 	pkgs := explodePkgList(flag.Args())
 	sort.Strings(pkgs)
 
-	wpkgs := pkgs
-	diffs := computeStale(wpkgs)
+	readPkgs(pkgs)
 
-	dirs := calcDirectiveList()
-	sort.Strings(dirs)
+	cmds := make(map[string]map[string]struct{})
+	pkgs = cmdList(pkgs, cmds)
 
-	if len(dirs) == 0 {
+	if len(cmds) == 0 {
+		vvlogln("No packages contain any directives")
 		os.Exit(0)
 	}
 
 	if *fList {
-		fmt.Println(strings.Join(dirs, "\n"))
+		allCmds := make(map[string]struct{})
+
+		for _, m := range cmds {
+			for k := range m {
+				allCmds[k] = struct{}{}
+			}
+		}
+		cs := keySlice(allCmds)
+		sort.Strings(cs)
+		fmt.Println(strings.Join(cs, "\n"))
 		os.Exit(0)
 	}
 
-	untypedCmds, typedCmds := validateCmds(dirs, *fUntyped, *fTyped)
+	untypedRunExp := buildGoGenRegex(config.Untyped)
+	typedRunExp := buildGoGenRegex(config.Typed)
 
-	untypedRunExp := buildGoGenRegex(untypedCmds)
-	typedRunExp := buildGoGenRegex(typedCmds)
+	diffs := computeStale(pkgs, false)
 
 	typedCount := 1
 
+	var suc, fail []string
+
 	for {
 		untypedCount := 1
+
+		if len(pkgs) == 0 {
+			vvlogln("No packages contain any directives")
+			os.Exit(0)
+		}
+
+		// in the first iteration the cmds map-list has already
+		// been populated above
+		if typedCount != 1 {
+			cmds = make(map[string]map[string]struct{})
+			_ = cmdList(pkgs, cmds)
+		}
+
+		preUntyped := snapHash(diffs)
+
+		// we only delete on the first run...
+		if typedCount == 1 {
+			rmGenFiles(diffs, config.Untyped)
+		}
 
 		for len(diffs) > 0 {
 			if untypedCount > untypedLoopLimit {
 				log.Fatalf("Exceeded loop limit for untyped go generate cmd: %v\n", untypedRunExp)
 			}
 
-			log.Printf("Untyped run %v\n", untypedCount)
+			vvlogf("Untyped iteration %v\n", untypedCount)
 			goGenerate(diffs, untypedRunExp)
 			untypedCount++
 
-			diffs = computeStale(diffs)
+			// order is significant here... because the computeStale
+			// call does a readPkgs
+			prevDiffs := diffs
+			diffs = computeStale(prevDiffs, true)
+			_ = cmdList(prevDiffs, cmds)
 		}
 
-		// TODO need this largely because of stringer
-		// https://github.com/golang/go/issues/10249
-		log.Printf("go install\n")
-		goInstall(wpkgs)
+		postUntypedDelta := deltaHash(preUntyped)
+
+		if len(fail) == 0 && len(postUntypedDelta) == 0 {
+			vvlogln("The hash delta post untyped phase was nothing; hence no need to move on")
+			os.Exit(0)
+		}
+
+		// are there any typed commands? If not, we're done
+		typedTodo := false
+
+		for c := range cmdMap(cmds) {
+			if _, ok := config.typedCmds[c]; ok {
+				typedTodo = true
+			}
+		}
+
+		if !typedTodo {
+			vvlogln("No packages contain any typed directives")
+			os.Exit(0)
+		}
+
+		if typedCount == 1 {
+			rmGenFiles(pkgs, config.Typed)
+		}
+
+		// TODO work out what to do here when gg is being used in conjunction
+		// with gai
+		suc, fail = goInstall(pkgs)
 
 		if typedCount > typedLoopLimit {
 			log.Fatalf("Exceeded loop limit for typed go generate cmd: %v\n", untypedRunExp)
 		}
 
-		log.Printf("Typed run %v\n", typedCount)
-		goGenerate(wpkgs, typedRunExp)
+		vvlogf("Typed iteration %v\n", typedCount)
+		goGenerate(suc, typedRunExp)
 		typedCount++
 
-		diffs = computeStale(wpkgs)
+		// order is significant here... because the computeStale
+		// call does a readPkgs
+		diffs = computeStale(suc, true)
 
-		if len(diffs) == 0 {
+		if len(diffs) == 0 && len(fail) == 0 {
 			break
 		}
 
-		wpkgs = diffs
-
+		pkgs = append(fail, diffs...)
 	}
 }
-
-type Package struct {
-	Dir          string
-	ImportPath   string
-	Standard     bool
-	Goroot       bool
-	Stale        bool
-	GoFiles      []string
-	CgoFiles     []string
-	CFiles       []string
-	CXXFiles     []string
-	MFiles       []string
-	HFiles       []string
-	SFiles       []string
-	SwigFiles    []string
-	SwigCXXFiles []string
-	SysoFiles    []string
-	Imports      []string
-	Deps         []string
-	Incomplete   bool
-	Error        *PackageError
-	DepsErrors   []*PackageError
-	TestGoFiles  []string
-	TestImports  []string
-	XTestGoFiles []string
-	XTestImports []string
-
-	pkgHash string
-}
-
-type PackageError struct {
-	ImportStack []string
-	Pos         string
-	Err         string
-}
-
-func explodePkgList(pkgs []string) []string {
-	out, err := exec.Command("go", append([]string{"list", "-e"}, pkgs...)...).CombinedOutput()
-	if err != nil {
-		log.Fatalf("go list: %v\n", err)
-	}
-
-	return strings.Fields(string(out))
-}
-
-func readPkgs(pkgs []string) {
-	out, err := exec.Command("go", append([]string{"list", "-e", "-json"}, pkgs...)...).CombinedOutput()
-	if err != nil {
-		log.Fatalf("go list: %v\n", err)
-	}
-
-	dec := json.NewDecoder(bytes.NewReader(out))
-	for {
-		var p Package
-		if err := dec.Decode(&p); err != nil {
-			if err == io.EOF {
-				break
-			}
-			log.Fatalf("reading go list output: %v", err)
-		}
-
-		if p.Incomplete {
-			// TODO this could probably be improved
-
-			errs := []interface{}{"Error in package ", p.ImportPath, "\n"}
-			if p.Error != nil {
-				errs = append(errs, p.Error.Err)
-			}
-			for _, e := range p.DepsErrors {
-				errs = append(errs, e.Err)
-			}
-			log.Fatal(errs...)
-		}
-
-		pkgInfo[p.ImportPath] = &p
-	}
-}
-
-func computeStale(pkgs []string) []string {
-	prevHashes := make(map[string]string, len(pkgs))
-	for _, p := range pkgs {
-		v := ""
-
-		if pkg, ok := pkgInfo[p]; ok {
-			v = pkg.pkgHash
-		}
-
-		prevHashes[p] = v
-	}
-
-	readPkgs(pkgs)
-
-	for _, pkg := range pkgs {
-		computePkgHash(pkgInfo[pkg])
-	}
-
-	var deltas []string
-
-	for _, p := range pkgs {
-		if prevHashes[p] != pkgInfo[p].pkgHash {
-			deltas = append(deltas, p)
-		}
-	}
-
-	return deltas
-}
-
-func computePkgHash(p *Package) {
-	h := sha1.New()
-
-	fmt.Fprintf(h, "pkg %v\n", p.ImportPath)
-
-	hashFiles(h, p.Dir, p.GoFiles)
-	hashFiles(h, p.Dir, p.CgoFiles)
-	hashFiles(h, p.Dir, p.CFiles)
-	hashFiles(h, p.Dir, p.CXXFiles)
-	hashFiles(h, p.Dir, p.MFiles)
-	hashFiles(h, p.Dir, p.HFiles)
-	hashFiles(h, p.Dir, p.SFiles)
-	hashFiles(h, p.Dir, p.SwigFiles)
-	hashFiles(h, p.Dir, p.SwigCXXFiles)
-	hashFiles(h, p.Dir, p.SysoFiles)
-	hashFiles(h, p.Dir, p.TestGoFiles)
-	hashFiles(h, p.Dir, p.XTestGoFiles)
-
-	hash := fmt.Sprintf("%x", h.Sum(nil))
-	p.pkgHash = hash
-}
-
-func hashFiles(h io.Writer, dir string, files []string) {
-	for _, file := range files {
-		f, err := os.Open(filepath.Join(dir, file))
-		if err != nil {
-			log.Fatalf("hashFiles: %v\n", err)
-		}
-
-		fmt.Fprintf(h, "file %s\n", file)
-		n, _ := io.Copy(h, f)
-		fmt.Fprintf(h, "%d bytes\n", n)
-
-		f.Close()
-	}
-}
-
-func splitCmdList(s string) []string {
-	s = strings.TrimSpace(s)
-	ps := strings.Split(s, ",")
-
-	parts := make([]string, 0, len(ps))
-
-	for _, v := range ps {
-		v = strings.TrimSpace(v)
-
-		if v == "" {
-			continue
-		}
-
-		if !validCmd.MatchString(v) {
-			log.Fatalf("Invalid go generate cmd: %v\n", v)
-		}
-
-		parts = append(parts, v)
-	}
-
-	return parts
-}
-
-func validateCmds(dirs []string, untypedList, typedList string) ([]string, []string) {
-	ntcmds := splitCmdList(untypedList)
-	tcmds := splitCmdList(typedList)
-
-	dmap := make(map[string]bool)
-	ntmap := make(map[string]struct{})
-	tmap := make(map[string]struct{})
-
-	for _, v := range dirs {
-		dmap[v] = false
-	}
-
-	for _, v := range ntcmds {
-		if _, ok := dmap[v]; !ok {
-			log.Fatalf("Directive provided but does not appear in any files: %q\n", v)
-		}
-
-		dmap[v] = true
-		ntmap[v] = struct{}{}
-	}
-
-	for _, v := range tcmds {
-		if _, ok := dmap[v]; !ok {
-			log.Fatalf("Directive provided but does not appear in any files: %v\n", v)
-		}
-
-		if _, ok := ntmap[v]; ok {
-			log.Fatalf("Directive provided as both typed and untyped: %v\n", v)
-		}
-
-		dmap[v] = true
-		tmap[v] = struct{}{}
-	}
-
-	for k, v := range dmap {
-		if !v {
-			log.Fatalf("Directive appears in source files but not categorised as either typed and untyped: %v\n", k)
-		}
-	}
-
-	// now de-dup just for completeness
-	ntcmds = make([]string, 0, len(ntmap))
-	tcmds = make([]string, 0, len(tmap))
-
-	for k := range ntmap {
-		ntcmds = append(ntcmds, k)
-	}
-
-	for k := range tmap {
-		tcmds = append(tcmds, k)
-	}
-
-	return ntcmds, tcmds
-}
-
-// TODO this is probably too restrictive
-var validCmd = regexp.MustCompile(`^[a-zA-Z0-9]+$`)
 
 func buildGoGenRegex(parts []string) string {
 	escpd := make([]string, len(parts))
 
 	for i := range parts {
-		escpd[i] = regexp.QuoteMeta(parts[i])
+		cmd := filepath.Base(parts[i])
+		escpd[i] = regexp.QuoteMeta(cmd)
 	}
 
-	exp := fmt.Sprintf("//go:generate (?:%v)(?:$| )", strings.Join(escpd, "|"))
+	exp := fmt.Sprintf(gogenerate.GoGeneratePrefix+" (?:%v)(?:$| )", strings.Join(escpd, "|"))
 
 	// aggressively ensure the regexp compiles here... else a call to go generate
 	// will be useless
@@ -366,56 +199,93 @@ func goGenerate(pkgs []string, runExp string) {
 
 	args = append(args, pkgs...)
 
+	xlogln("go ", strings.Join(args, " "))
+
 	out, err := exec.Command("go", args...).CombinedOutput()
 	if err != nil {
 		log.Fatalf("go generate: %v\n%s", err, out)
 	}
 
 	if len(out) > 0 {
+		// we always log the output from go generate
 		fmt.Print(string(out))
 	}
 }
 
-func goInstall(pkgs []string) {
+func goInstall(pkgs []string) ([]string, []string) {
+	fmap := make(map[string]struct{})
+
 	args := append([]string{"install"}, pkgs...)
-	// TODO is there anything better we can do than simply ignore the exit status of go install?
-	// because things are in a partial state
-	out, _ := exec.Command("go", args...).CombinedOutput()
 
-	if *fExecute {
-		c := make([]interface{}, 1, len(args)+1)
+	xlogln("go", strings.Join(args, " "))
 
-		c[0] = "go"
+	out, err := exec.Command("go", args...).CombinedOutput()
 
-		for _, v := range args {
-			c = append(c, v)
+	// TODO this is probably a bit brittle... if there is an error we get the list of
+	// packages where there is an error and return that
+
+	if err != nil {
+		sc := bufio.NewScanner(bytes.NewBuffer(out))
+		for sc.Scan() {
+			line := sc.Text()
+
+			if strings.HasPrefix(line, "# ") {
+				parts := strings.Fields(line)
+
+				if len(parts) != 2 {
+					log.Fatalf("could not parse go install output\n%v", string(out))
+				}
+
+				fmap[parts[1]] = struct{}{}
+			}
 		}
 
-		fmt.Println(c...)
-		if len(out) > 0 {
-			fmt.Printf(string(out))
+		if err := sc.Err(); err != nil {
+			log.Fatalf("could not parse go install output\n%v", string(out))
 		}
 	}
+
+	if len(out) > 0 {
+		xlog(string(out))
+	}
+
+	var f, s []string
+
+	for _, p := range pkgs {
+		if _, ok := fmap[p]; ok {
+			f = append(f, p)
+		} else {
+			s = append(s, p)
+		}
+	}
+
+	return s, f
 }
 
-func calcDirectiveList() []string {
-	res := make(map[string]struct{})
+func cmdList(pNames []string, cmds map[string]map[string]struct{}) []string {
+	dirPkgs := make(map[string]struct{})
 
-	for _, v := range pkgInfo {
+	for _, pName := range pNames {
+		if _, ok := cmds[pName]; !ok {
+			cmds[pName] = make(map[string]struct{})
+		}
+
+		pkg := pkgInfo[pName]
 
 		var goFiles []string
-		goFiles = append(goFiles, v.GoFiles...)
-		goFiles = append(goFiles, v.CgoFiles...)
-		goFiles = append(goFiles, v.TestGoFiles...)
-		goFiles = append(goFiles, v.XTestGoFiles...)
+		goFiles = append(goFiles, pkg.GoFiles...)
+		goFiles = append(goFiles, pkg.CgoFiles...)
+		goFiles = append(goFiles, pkg.TestGoFiles...)
+		goFiles = append(goFiles, pkg.XTestGoFiles...)
 
 		for _, f := range goFiles {
 
-			f = filepath.Join(v.Dir, f)
+			f = filepath.Join(pkg.Dir, f)
 
 			of, err := os.Open(f)
 			if err != nil {
-				log.Fatalf("calc gen list: %v\n", err)
+				panic(err)
+				// log.Fatalf("calc gen list: %v\n", err)
 			}
 
 			// largely borrowed from cmd/go/generate.go
@@ -454,13 +324,15 @@ func calcDirectiveList() []string {
 				}
 
 				if isGoGenerate(buf) {
+					dirPkgs[pName] = struct{}{}
+
 					parts := strings.Fields(string(buf))
 
 					if len(parts) < 2 {
 						log.Fatalf("calc gen list: no arguments to direct on line %v in %v\n", line, f)
 					}
 
-					res[parts[1]] = struct{}{}
+					cmds[pName][parts[1]] = struct{}{}
 				}
 			}
 
@@ -468,13 +340,101 @@ func calcDirectiveList() []string {
 		}
 	}
 
-	ps := make([]string, 0, len(res))
+	cm := cmdMap(cmds)
 
-	for k := range res {
-		ps = append(ps, k)
+	for v := range cm {
+
+		_, tok := config.typedCmds[v]
+		_, uok := config.untypedCmds[v]
+
+		if !tok && !uok {
+			log.Fatalln("go generate directive command \"%v\" is not specified as either typed or untyped")
+		}
 	}
 
-	return ps
+	return keySlice(dirPkgs)
+}
+
+func rmGenFiles(pkgs []string, cmds []string) {
+	for _, p := range pkgs {
+		dir := pkgInfo[p].Dir
+
+		files, err := ioutil.ReadDir(dir)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+	File:
+		for _, file := range files {
+			if file.IsDir() {
+				continue
+			}
+
+			fn := file.Name()
+
+			if !strings.HasPrefix(fn, "gen_") {
+				continue
+			}
+
+			for _, cmd := range cmds {
+				if strings.HasSuffix(fn, "."+cmd+".go") {
+					fp := filepath.Join(dir, fn)
+
+					vvlogln("Removing ", fp)
+					os.Remove(fp)
+
+					continue File
+				}
+			}
+		}
+
+	}
+}
+
+func xlogln(args ...interface{}) {
+	if *fVVerbose || *fExecute {
+		log.Println(args...)
+	}
+}
+
+func xlog(args ...interface{}) {
+	if *fVVerbose || *fExecute {
+		log.Print(args...)
+	}
+}
+
+func vvlogln(args ...interface{}) {
+	if *fVVerbose {
+		log.Println(args...)
+	}
+}
+
+func vvlogf(format string, args ...interface{}) {
+	if *fVVerbose {
+		log.Printf(format, args...)
+	}
+}
+
+func cmdMap(cmds map[string]map[string]struct{}) map[string]struct{} {
+	allCmds := make(map[string]struct{})
+
+	for _, m := range cmds {
+		for k := range m {
+			allCmds[k] = struct{}{}
+		}
+	}
+
+	return allCmds
+}
+
+func keySlice(m map[string]struct{}) []string {
+	res := make([]string, 0, len(m))
+
+	for k := range m {
+		res = append(res, k)
+	}
+
+	return res
 }
 
 // borrowed from cmd/go/generate.go
