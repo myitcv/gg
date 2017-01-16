@@ -1,0 +1,1 @@
+    ./_vendor/src/github.com/myitcv/gogenerate  60b1cbbb5f41fe4827f6405078b4119a3c4c2418  git@github.com:myitcv/gogenerate
