@@ -46,9 +46,10 @@ import (
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-// A Generator represents the state of a single Go source file
+// A generator represents the state of a single Go source file
 // being scanned for generator commands.
-type Generator struct {
+type generator struct {
+	f        func(dirArgs []string)
 	r        io.Reader
 	path     string // full rooted path name.
 	dir      string // full rooted directory of file.
@@ -59,14 +60,34 @@ type Generator struct {
 	env      []string
 }
 
+// DirFunc runs f(cmds) on each go generate directive (as defined by
+// go generate -help) found in the absolute-named file that is part
+// of package pkg
+func DirFunc(pkg string, name string, f func(dirArgs []string)) error {
+	fi, err := os.Open(name)
+	if err != nil {
+		return err
+	}
+	defer fi.Close()
+
+	g := &generator{
+		f:        f,
+		pkg:      pkg,
+		commands: make(map[string][]string),
+		path:     name,
+		r:        fi,
+	}
+
+	return g.matches()
+}
+
 // run runs the generators in the current file.
-func (g *Generator) matches(cmds []string) (ok bool, err error) {
+func (g *generator) matches() (err error) {
 	// Processing below here calls g.errorf on failure, which does panic(stop).
 	// If we encounter an error, we abort the package.
 	defer func() {
 		e := recover()
 		if e, isErr := e.(error); isErr {
-			ok = false
 			err = e
 		}
 	}()
@@ -119,17 +140,13 @@ func (g *Generator) matches(cmds []string) (ok bool, err error) {
 			continue
 		}
 
-		for _, c := range cmds {
-			if c == words[0] {
-				return true, nil
-			}
-		}
+		g.f(words)
 	}
 	if err != nil && err != io.EOF {
 		g.errorf("error reading")
 	}
 
-	return false, nil
+	return nil
 }
 
 func isGoGenerate(buf []byte) bool {
@@ -138,7 +155,7 @@ func isGoGenerate(buf []byte) bool {
 
 // setEnv sets the extra environment variables used when executing a
 // single go:generate command.
-func (g *Generator) setEnv() {
+func (g *generator) setEnv() {
 	g.env = []string{
 		"GOARCH=" + build.Default.GOARCH,
 		"GOOS=" + build.Default.GOOS,
@@ -152,7 +169,7 @@ func (g *Generator) setEnv() {
 // split breaks the line into words, evaluating quoted
 // strings and evaluating environment variables.
 // The initial //go:generate element is present in line.
-func (g *Generator) split(line string) []string {
+func (g *generator) split(line string) []string {
 	// Parse line, obeying quoted strings.
 	var words []string
 	line = line[len("//go:generate ") : len(line)-1] // Drop preamble and final newline.
@@ -214,13 +231,13 @@ Words:
 // errorf logs an error message prefixed with the file and line number.
 // It then exits the program (with exit status 1) because generation stops
 // at the first error.
-func (g *Generator) errorf(format string, args ...interface{}) {
+func (g *generator) errorf(format string, args ...interface{}) {
 	panic(fmt.Errorf("%s:%d: %s", g.path, g.lineNum, fmt.Sprintf(format, args...)))
 }
 
 // expandVar expands the $XXX invocation in word. It is called
 // by os.Expand.
-func (g *Generator) expandVar(word string) string {
+func (g *generator) expandVar(word string) string {
 	w := word + "="
 	for _, e := range g.env {
 		if strings.HasPrefix(e, w) {
@@ -231,7 +248,7 @@ func (g *Generator) expandVar(word string) string {
 }
 
 // setShorthand installs a new shorthand as defined by a -command directive.
-func (g *Generator) setShorthand(words []string) {
+func (g *generator) setShorthand(words []string) {
 	// Create command shorthand.
 	if len(words) == 1 {
 		g.errorf("no command specified for -command")

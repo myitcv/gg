@@ -97,11 +97,12 @@ func main() {
 		// we only delete on the first run...
 		if typedCount == 1 {
 			rmGenFiles(diffs, config.Untyped)
+			rmGenFiles(pkgs, config.Typed)
 		}
 
 		for len(diffs) > 0 {
 			if untypedCount > untypedLoopLimit {
-				log.Fatalf("Exceeded loop limit for untyped go generate cmd: %v\n", untypedRunExp)
+				fatalf("Exceeded loop limit for untyped go generate cmd: %v\n", untypedRunExp)
 			}
 
 			vvlogf("Untyped iteration %v\n", untypedCount)
@@ -136,16 +137,16 @@ func main() {
 			os.Exit(0)
 		}
 
-		if typedCount == 1 {
-			rmGenFiles(pkgs, config.Typed)
-		}
-
 		// TODO work out what to do here when gg is being used in conjunction
 		// with gai
 		suc, fail = goInstall(pkgs)
 
+		if len(suc) == 0 {
+			fatalf("No packages from %v succeeded install; cannot continue\n", pkgs)
+		}
+
 		if typedCount > typedLoopLimit {
-			log.Fatalf("Exceeded loop limit for typed go generate cmd: %v\n", untypedRunExp)
+			fatalf("Exceeded loop limit for typed go generate cmd: %v\n", untypedRunExp)
 		}
 
 		vvlogf("Typed iteration %v\n", typedCount)
@@ -178,7 +179,7 @@ func buildGoGenRegex(parts []string) string {
 	// will be useless
 	_, err := regexp.Compile(exp)
 	if err != nil {
-		log.Fatalf("Could not form valid go generate command: %v\n", err)
+		fatalf("Could not form valid go generate command: %v\n", err)
 	}
 
 	return exp
@@ -203,7 +204,7 @@ func goGenerate(pkgs []string, runExp string) {
 
 	out, err := exec.Command("go", args...).CombinedOutput()
 	if err != nil {
-		log.Fatalf("go generate: %v\n%s", err, out)
+		fatalf("go generate: %v\n%s", err, out)
 	}
 
 	if len(out) > 0 {
@@ -215,38 +216,44 @@ func goGenerate(pkgs []string, runExp string) {
 func goInstall(pkgs []string) ([]string, []string) {
 	fmap := make(map[string]struct{})
 
-	args := append([]string{"install"}, pkgs...)
+	cmds := [][]string{
+		append([]string{"install"}, pkgs...),
+		append([]string{"test", "-i"}, pkgs...),
+	}
 
-	xlogln("go", strings.Join(args, " "))
+	for _, args := range cmds {
 
-	out, err := exec.Command("go", args...).CombinedOutput()
+		xlogln("go", strings.Join(args, " "))
 
-	// TODO this is probably a bit brittle... if there is an error we get the list of
-	// packages where there is an error and return that
+		out, err := exec.Command("go", args...).CombinedOutput()
 
-	if err != nil {
-		sc := bufio.NewScanner(bytes.NewBuffer(out))
-		for sc.Scan() {
-			line := sc.Text()
+		// TODO this is probably a bit brittle... if there is an error we get the list of
+		// packages where there is an error and return that
 
-			if strings.HasPrefix(line, "# ") {
-				parts := strings.Fields(line)
+		if err != nil {
+			sc := bufio.NewScanner(bytes.NewBuffer(out))
+			for sc.Scan() {
+				line := sc.Text()
 
-				if len(parts) != 2 {
-					log.Fatalf("could not parse go install output\n%v", string(out))
+				if strings.HasPrefix(line, "# ") {
+					parts := strings.Fields(line)
+
+					if len(parts) != 2 {
+						fatalf("could not parse go install output\n%v", string(out))
+					}
+
+					fmap[parts[1]] = struct{}{}
 				}
+			}
 
-				fmap[parts[1]] = struct{}{}
+			if err := sc.Err(); err != nil {
+				fatalf("could not parse go install output\n%v", string(out))
 			}
 		}
 
-		if err := sc.Err(); err != nil {
-			log.Fatalf("could not parse go install output\n%v", string(out))
+		if len(out) > 0 {
+			xlog(string(out))
 		}
-	}
-
-	if len(out) > 0 {
-		xlog(string(out))
 	}
 
 	var f, s []string
@@ -285,7 +292,7 @@ func cmdList(pNames []string, cmds map[string]map[string]struct{}) []string {
 			of, err := os.Open(f)
 			if err != nil {
 				panic(err)
-				// log.Fatalf("calc gen list: %v\n", err)
+				// fatalf("calc gen list: %v\n", err)
 			}
 
 			// largely borrowed from cmd/go/generate.go
@@ -308,7 +315,7 @@ func cmdList(pNames []string, cmds map[string]map[string]struct{}) []string {
 					}
 
 					if err != nil {
-						log.Fatalf("calc gen list: failed to recover from long line: %v\n", err)
+						fatalf("calc gen list: failed to recover from long line: %v\n", err)
 					}
 
 					// we recovered...
@@ -320,7 +327,7 @@ func cmdList(pNames []string, cmds map[string]map[string]struct{}) []string {
 				}
 
 				if err != nil {
-					log.Fatalf("calc gen list: %v\n", err)
+					fatalf("calc gen list: %v\n", err)
 				}
 
 				if isGoGenerate(buf) {
@@ -329,7 +336,7 @@ func cmdList(pNames []string, cmds map[string]map[string]struct{}) []string {
 					parts := strings.Fields(string(buf))
 
 					if len(parts) < 2 {
-						log.Fatalf("calc gen list: no arguments to direct on line %v in %v\n", line, f)
+						fatalf("calc gen list: no arguments to direct on line %v in %v\n", line, f)
 					}
 
 					cmds[pName][parts[1]] = struct{}{}
@@ -389,6 +396,10 @@ func rmGenFiles(pkgs []string, cmds []string) {
 		}
 
 	}
+}
+
+func fatalf(format string, args ...interface{}) {
+	log.Fatalf(format, args...)
 }
 
 func xlogln(args ...interface{}) {
