@@ -10,7 +10,6 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"os"
@@ -277,6 +276,12 @@ func cmdList(pNames []string, cmds map[string]map[string]struct{}) []string {
 			cmds[pName] = make(map[string]struct{})
 		}
 
+		visitDir := func(dirArgs []string) {
+			dirPkgs[pName] = struct{}{}
+
+			cmds[pName][dirArgs[0]] = struct{}{}
+		}
+
 		pkg := pkgInfo[pName]
 
 		var goFiles []string
@@ -289,61 +294,7 @@ func cmdList(pNames []string, cmds map[string]map[string]struct{}) []string {
 
 			f = filepath.Join(pkg.Dir, f)
 
-			of, err := os.Open(f)
-			if err != nil {
-				panic(err)
-				// fatalf("calc gen list: %v\n", err)
-			}
-
-			// largely borrowed from cmd/go/generate.go
-
-			input := bufio.NewReader(of)
-			line := 0
-			for {
-				line++
-
-				var buf []byte
-				buf, err = input.ReadSlice('\n')
-				if err == bufio.ErrBufferFull {
-					// Line too long - consume and ignore.
-					if isGoGenerate(buf) {
-						log.Printf("calc gen list: directive too long in on line %v in %v\n", line, f)
-					}
-
-					for err == bufio.ErrBufferFull {
-						_, err = input.ReadSlice('\n')
-					}
-
-					if err != nil {
-						fatalf("calc gen list: failed to recover from long line: %v\n", err)
-					}
-
-					// we recovered...
-					continue
-				}
-
-				if err == io.EOF {
-					break
-				}
-
-				if err != nil {
-					fatalf("calc gen list: %v\n", err)
-				}
-
-				if isGoGenerate(buf) {
-					dirPkgs[pName] = struct{}{}
-
-					parts := strings.Fields(string(buf))
-
-					if len(parts) < 2 {
-						fatalf("calc gen list: no arguments to direct on line %v in %v\n", line, f)
-					}
-
-					cmds[pName][parts[1]] = struct{}{}
-				}
-			}
-
-			of.Close()
+			gogenerate.DirFunc(pName, f, visitDir)
 		}
 	}
 
@@ -446,9 +397,4 @@ func keySlice(m map[string]struct{}) []string {
 	}
 
 	return res
-}
-
-// borrowed from cmd/go/generate.go
-func isGoGenerate(buf []byte) bool {
-	return bytes.HasPrefix(buf, []byte("//go:generate ")) || bytes.HasPrefix(buf, []byte("//go:generate\t"))
 }
