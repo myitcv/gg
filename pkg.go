@@ -1,14 +1,11 @@
 package main
 
 import (
-	"bytes"
 	"crypto/sha1"
-	"encoding/json"
 	"fmt"
+	"go/build"
 	"io"
-	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -18,108 +15,41 @@ var (
 )
 
 type Package struct {
-	Dir          string
-	ImportPath   string
-	Standard     bool
-	Goroot       bool
-	Stale        bool
-	GoFiles      []string
-	CgoFiles     []string
-	CFiles       []string
-	CXXFiles     []string
-	MFiles       []string
-	HFiles       []string
-	SFiles       []string
-	SwigFiles    []string
-	SwigCXXFiles []string
-	SysoFiles    []string
-	Imports      []string
-	Deps         []string
-	Incomplete   bool
-	Error        *PackageError
-	DepsErrors   []*PackageError
-	TestGoFiles  []string
-	TestImports  []string
-	XTestGoFiles []string
-	XTestImports []string
+	*build.Package
 
 	pkgHash string
 }
 
-type PackageError struct {
-	ImportStack []string
-	Pos         string
-	Err         string
-}
-
-func explodePkgList(pkgs []string) []string {
-	out, err := exec.Command("go", append([]string{"list", "-e"}, pkgs...)...).CombinedOutput()
-	if err != nil {
-		log.Fatalf("go list: %v\n", err)
-	}
-
-	all := strings.Fields(string(out))
-
-	if len(fXPkgs) == 0 {
-		return all
-	}
-
-	res := make([]string, 0, len(fXPkgs))
+func readPkgs(pkgs []string, ignore bool) {
 
 All:
-	for _, a := range all {
-		for _, x := range fXPkgs {
-			if strings.HasSuffix(x, "/...") {
-				p := strings.TrimSuffix(x, "/...")
+	for _, pn := range pkgs {
+		p, err := build.Import(pn, wd, 0)
+		if err != nil {
+			fatalf("could not load package %v: %v", pn, err)
+		}
 
-				if a == p || strings.HasPrefix(a, p+"/") {
-					continue All
+		if ignore {
+			a := p.ImportPath
+
+			for _, x := range fXPkgs {
+				if strings.HasSuffix(x, "/...") {
+					p := strings.TrimSuffix(x, "/...")
+
+					if a == p || strings.HasPrefix(a, p+"/") {
+						continue All
+					}
+				} else {
+					if a == x {
+						continue All
+					}
 				}
-			} else {
-				if a == x {
-					continue All
-				}
+
 			}
 
 		}
 
-		res = append(res, a)
-	}
-
-	return res
-}
-
-func readPkgs(pkgs []string) {
-	args := append([]string{"list", "-e", "-json"}, pkgs...)
-	out, err := exec.Command("go", args...).CombinedOutput()
-	if err != nil {
-		log.Fatalf("go list: %v\n%s", err, string(out))
-	}
-
-	dec := json.NewDecoder(bytes.NewReader(out))
-	for {
-		var p Package
-		if err := dec.Decode(&p); err != nil {
-			if err == io.EOF {
-				break
-			}
-			log.Fatalf("reading go list output: %v", err)
-		}
-
-		if p.Incomplete {
-			// TODO this could probably be improved
-
-			errs := []interface{}{"Error in package ", p.ImportPath, "\n"}
-			if p.Error != nil {
-				errs = append(errs, p.Error.Err)
-			}
-			for _, e := range p.DepsErrors {
-				errs = append(errs, e.Err)
-			}
-			log.Fatal(errs...)
-		}
-
-		pkgInfo[p.ImportPath] = &p
+		pkgInfo[p.ImportPath] = &Package{Package: p}
 	}
 }
 
@@ -142,7 +72,7 @@ func computeStale(pkgs []string, read bool) []string {
 	snap := snapHash(pkgs)
 
 	if read {
-		readPkgs(pkgs)
+		readPkgs(pkgs, false)
 	}
 
 	for _, pkg := range pkgs {
@@ -188,9 +118,10 @@ func computePkgHash(p *Package) {
 
 func hashFiles(h io.Writer, dir string, files []string) {
 	for _, file := range files {
-		f, err := os.Open(filepath.Join(dir, file))
+		fn := filepath.Join(dir, file)
+		f, err := os.Open(fn)
 		if err != nil {
-			log.Fatalf("hashFiles: %v\n", err)
+			fatalf("could not open file %v: %v\n", fn, err)
 		}
 
 		fmt.Fprintf(h, "file %s\n", file)

@@ -17,9 +17,11 @@ type Config struct {
 	Typed   []string
 	Untyped []string
 
+	// maps of the packages
 	typed   map[string]struct{}
 	untyped map[string]struct{}
 
+	// maps of the commands, essentially the bases of the packages
 	typedCmds   map[string]struct{}
 	untypedCmds map[string]struct{}
 }
