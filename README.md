@@ -3,7 +3,7 @@
 _Very much work in progress._
 
 ```bash
-go get -u github.com/myitcv/gg
+go get -u myitcv.io/gg
 
 # list all go:generate directives in packages ./...
 gg -l ./...
