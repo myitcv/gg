@@ -8,7 +8,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os/exec"
 	"sort"
+	"strings"
 )
 
 const (
@@ -63,15 +65,15 @@ func loadPkgs(specs []string) pkgSet {
 	}
 	specs = append(specs, rdeps...)
 
-	var toolsToLoad []string
-	for t := range readPkgs(specs, loaded, false) {
-		if t.isTool && !t.inPkgSpec {
-			toolsToLoad = append(toolsToLoad, t.ImportPath)
+	var toolsAndOutPkgs []string
+	for t := range readPkgs(specs, loaded, false, false) {
+		if !t.inPkgSpec {
+			toolsAndOutPkgs = append(toolsAndOutPkgs, t.ImportPath)
 		}
 	}
 
 	// skip scanning for any directives... these are external tools
-	readPkgs(toolsToLoad, loaded, true)
+	readPkgs(toolsAndOutPkgs, loaded, true, true)
 
 	// now ensure we have loaded any tools that we not part of the original
 	// package spec
@@ -81,6 +83,9 @@ func loadPkgs(specs []string) pkgSet {
 	// some point later
 	for p := range loaded {
 		p.pending = new(int)
+		if !p.inPkgSpec {
+			continue
+		}
 		for d := range p.deps {
 			if d.rdeps == nil {
 				d.rdeps = make(pkgSet)
@@ -98,21 +103,8 @@ func loadPkgs(specs []string) pkgSet {
 			if t.rdeps == nil {
 				t.rdeps = make(pkgSet)
 			}
-			if t.pending == nil {
-				// it's a tool; we haven't seen it yet. At the very
-				// least we will need to install it
-				*p.pending++
-			} else if *t.pending > 0 {
-				*p.pending++
-			}
 			t.rdeps[p] = true
-		}
-		if p.isTool {
-			// we set a pending for the install
 			*p.pending++
-		}
-		if p.isTool {
-			fmt.Printf("Tool > %v\n", p)
 		}
 	}
 
@@ -134,7 +126,7 @@ func main() {
 		if p.isTool {
 			fmt.Printf("%v %v\n", *p.pending, p)
 		}
-		if p.isTool && *p.pending == 1 {
+		if p.isTool && *p.pending == 0 {
 			possRoots[p] = true
 		}
 	}
@@ -154,16 +146,32 @@ func main() {
 
 	var h *pkg
 
+	// TODO make this concurrent where we can; i.e. go install steps
+	// and go generate steps where there are disjoint output packages
 	for len(work) > 0 {
 		h, work = work[0], work[1:]
 		if h.isTool {
-			fmt.Printf("Compile %v\n", h)
+			cmd := exec.Command("go", "install", h.ImportPath)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				fatalf("failed to run %v: %v\n%s", strings.Join(cmd.Args, " "), err, out)
+			}
+			fmt.Printf("%v\n", strings.Join(cmd.Args, " "))
 		} else {
+			// type hashRes map[string]string
+			// hash := func() hashRes {
+			// 	res := make(hashRes)
+			// 	res[h.ImportPath] = string(h.hash())
+			// 	for _, outPkgMap := range h.toolDeps {
+			// 		for op := range outPkgMap {
+			// 		}
+			// 	}
+			// }
 			fmt.Printf("go generate %v\n", h)
 		}
 		for rd := range h.rdeps {
 			*rd.pending--
-			if *rd.pending == 0 || (rd.isTool && *rd.pending == 1) {
+			if *rd.pending == 0 {
 				work = append(work, rd)
 			}
 		}
@@ -173,19 +181,8 @@ func main() {
 		if p.isTestPkg {
 			continue
 		}
-		p.rehash()
-		fmt.Printf("%#x %v\n", p.hash, p)
+		fmt.Printf("%#x %v\n", p.hash(), p)
 	}
-
-}
-
-func importPaths(ps pkgSet) []string {
-	var vs []string
-	for p := range ps {
-		vs = append(vs, p.ImportPath)
-	}
-	sort.Strings(vs)
-	return vs
 
 }
 
@@ -205,16 +202,4 @@ func vvlogf(format string, args ...interface{}) {
 	if *fVVerbose {
 		log.Printf(format, args...)
 	}
-}
-
-func cmdMap(cmds map[string]map[string]struct{}) map[string]struct{} {
-	allCmds := make(map[string]struct{})
-
-	for _, m := range cmds {
-		for k := range m {
-			allCmds[k] = struct{}{}
-		}
-	}
-
-	return allCmds
 }

@@ -44,8 +44,6 @@ type Package struct {
 	// (because we don't need to distinguish in this
 	// direction)
 	rdeps map[string]bool
-
-	pkgHash string
 }
 
 type pkg struct {
@@ -62,7 +60,7 @@ type pkg struct {
 	isTestPkg bool
 
 	deps     map[*pkg]bool
-	toolDeps map[*pkg]map[string]bool
+	toolDeps map[*pkg]map[*pkg]bool
 
 	rdeps map[*pkg]bool
 
@@ -71,16 +69,16 @@ type pkg struct {
 	isTool  bool
 	pending *int
 
-	hash []byte
+	hashVal []byte
 }
 
 func (p *pkg) String() string {
 	return p.ImportPath
 }
 
-func (p *pkg) rehash() {
-	if p.hash != nil {
-		return
+func (p *pkg) hash() []byte {
+	if p.hashVal != nil {
+		return p.hashVal
 	}
 	h := sha256.New()
 	// when we enable full loading of deps this distinction will
@@ -99,15 +97,15 @@ func (p *pkg) rehash() {
 			return deps[i].ImportPath < deps[j].ImportPath
 		})
 		for _, d := range deps {
-			d.rehash()
-			if _, err := h.Write(d.hash); err != nil {
+			if _, err := h.Write(d.hash()); err != nil {
 				fatalf("failed to hash: %v", err)
 			}
 		}
 		p.hashFiles(h, p.GoFiles)
 		p.hashFiles(h, p.CgoFiles)
 	}
-	p.hash = h.Sum(nil)
+	p.hashVal = h.Sum(nil)
+	return p.hashVal
 }
 
 func (p *pkg) hashFiles(h hash.Hash, files []string) {
@@ -127,13 +125,14 @@ func (p *pkg) hashFiles(h hash.Hash, files []string) {
 
 type pkgSet map[*pkg]bool
 
-// returns the tools detected during scanning of the loaded packages
-func readPkgs(pkgs []string, loaded pkgSet, dontScan bool) pkgSet {
+// returns the tools and output packages detected during scanning of the loaded
+// packages' directives. These might need a second load
+func readPkgs(pkgs []string, loaded pkgSet, dontScan bool, notInPkgSpec bool) pkgSet {
 	if len(pkgs) == 0 {
 		return nil
 	}
 
-	tools := make(pkgSet)
+	toolsAndOutPkgs := make(pkgSet)
 	res := make(chan *Package)
 
 	go func() {
@@ -143,7 +142,7 @@ func readPkgs(pkgs []string, loaded pkgSet, dontScan bool) pkgSet {
 
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			fatalf("failed to run %v: %v", strings.Join(cmd.Args, " "))
+			fatalf("failed to run %v: %v\n%s", strings.Join(cmd.Args, " "), err, out)
 		}
 
 		dec := json.NewDecoder(bytes.NewReader(out))
@@ -173,11 +172,11 @@ func readPkgs(pkgs []string, loaded pkgSet, dontScan bool) pkgSet {
 		p.GoFiles = pp.GoFiles
 		p.CgoFiles = pp.CgoFiles
 
-		p.inPkgSpec = true
+		p.inPkgSpec = !notInPkgSpec
 		loaded[p] = true
 
 		// invalidate any existing hash
-		p.hash = nil
+		p.hashVal = nil
 
 		ip := pp.ImportPath
 		if strings.HasSuffix(ip, ".test") {
@@ -204,7 +203,7 @@ func readPkgs(pkgs []string, loaded pkgSet, dontScan bool) pkgSet {
 		gofiles = append(gofiles, pp.TestGoFiles...)
 		gofiles = append(gofiles, pp.XTestGoFiles...)
 
-		dirs := make(map[*pkg]map[string]bool)
+		dirs := make(map[*pkg]map[*pkg]bool)
 
 		for _, f := range gofiles {
 			check := func(line int, args []string) error {
@@ -218,10 +217,10 @@ func readPkgs(pkgs []string, loaded pkgSet, dontScan bool) pkgSet {
 				cmdPkg := resolve(cmdPath)
 				pm, ok := dirs[cmdPkg]
 				if !ok {
-					pm = make(map[string]bool)
+					pm = make(map[*pkg]bool)
 					dirs[cmdPkg] = pm
 					cmdPkg.isTool = true
-					tools[cmdPkg] = true
+					toolsAndOutPkgs[cmdPkg] = true
 				}
 
 				for i, a := range args {
@@ -271,7 +270,9 @@ func readPkgs(pkgs []string, loaded pkgSet, dontScan bool) pkgSet {
 						pkgPath = bpkg.ImportPath
 					}
 
-					pm[pkgPath] = true
+					outPkg := resolve(pkgPath)
+					pm[outPkg] = true
+					toolsAndOutPkgs[outPkg] = true
 				}
 
 				return nil
@@ -283,13 +284,13 @@ func readPkgs(pkgs []string, loaded pkgSet, dontScan bool) pkgSet {
 
 		for d, ods := range dirs {
 			if p.toolDeps == nil {
-				p.toolDeps = make(map[*pkg]map[string]bool)
+				p.toolDeps = make(map[*pkg]map[*pkg]bool)
 			}
 			p.toolDeps[d] = ods
 
 			// verify that none of the output directories are a Dep
 			for op := range ods {
-				if p.deps[resolve(op)] {
+				if p.deps[op] {
 					fatalf("package %v has directive %v that outputs to %v, but that is also a dep", p.ImportPath, d, op)
 				}
 			}
@@ -321,108 +322,29 @@ func readPkgs(pkgs []string, loaded pkgSet, dontScan bool) pkgSet {
 		// ====================
 		// DEBUG OUTPUT
 
-		fmt.Printf("%v\n", p.ImportPath)
+		// fmt.Printf("%v\n", p.ImportPath)
 
-		var ds []string
-		for d := range p.deps {
-			ds = append(ds, d.ImportPath)
-		}
-		sort.Strings(ds)
-		for _, d := range ds {
-			fmt.Printf(" d - %v\n", d)
-		}
-		for t, dirs := range p.toolDeps {
-			ods := ""
-			if len(dirs) != 0 {
-				var odss []string
-				for od := range dirs {
-					odss = append(odss, od)
-				}
-				sort.Strings(odss)
-				ods = fmt.Sprintf(" [%v]", strings.Join(odss, ","))
-			}
-			fmt.Printf(" t - %v%v\n", t, ods)
-		}
+		// var ds []string
+		// for d := range p.deps {
+		// 	ds = append(ds, d.ImportPath)
+		// }
+		// sort.Strings(ds)
+		// for _, d := range ds {
+		// 	fmt.Printf(" d - %v\n", d)
+		// }
+		// for t, dirs := range p.toolDeps {
+		// 	ods := ""
+		// 	if len(dirs) != 0 {
+		// 		var odss []string
+		// 		for od := range dirs {
+		// 			odss = append(odss, od.ImportPath)
+		// 		}
+		// 		sort.Strings(odss)
+		// 		ods = fmt.Sprintf(" [%v]", strings.Join(odss, ","))
+		// 	}
+		// 	fmt.Printf(" t - %v%v\n", t, ods)
+		// }
 	}
 
-	return tools
+	return toolsAndOutPkgs
 }
-
-// func snapHash(pkgs []string) map[string]string {
-// 	prevHashes := make(map[string]string, len(pkgs))
-// 	for _, p := range pkgs {
-// 		v := ""
-
-// 		if pkg, ok := pkgInfo[p]; ok {
-// 			v = pkg.pkgHash
-// 		}
-
-// 		prevHashes[p] = v
-// 	}
-
-// 	return prevHashes
-// }
-
-// func computeStale(pkgs []string, read bool) []string {
-// 	snap := snapHash(pkgs)
-
-// 	if read {
-// 		readPkgs(pkgs, false)
-// 	}
-
-// 	for _, pkg := range pkgs {
-// 		computePkgHash(pkgInfo[pkg])
-// 	}
-
-// 	return deltaHash(snap)
-// }
-
-// func deltaHash(snap map[string]string) []string {
-// 	var deltas []string
-
-// 	for p := range snap {
-// 		if snap[p] != pkgInfo[p].pkgHash {
-// 			deltas = append(deltas, p)
-// 		}
-// 	}
-
-// 	return deltas
-// }
-
-// func computePkgHash(p *Package) {
-// 	h := sha1.New()
-
-// 	fmt.Fprintf(h, "pkg %v\n", p.ImportPath)
-
-// 	hashFiles(h, p.Dir, p.GoFiles)
-// 	hashFiles(h, p.Dir, p.CgoFiles)
-// 	hashFiles(h, p.Dir, p.CFiles)
-// 	hashFiles(h, p.Dir, p.CXXFiles)
-// 	hashFiles(h, p.Dir, p.MFiles)
-// 	hashFiles(h, p.Dir, p.HFiles)
-// 	hashFiles(h, p.Dir, p.SFiles)
-// 	hashFiles(h, p.Dir, p.SwigFiles)
-// 	hashFiles(h, p.Dir, p.SwigCXXFiles)
-// 	hashFiles(h, p.Dir, p.SysoFiles)
-// 	hashFiles(h, p.Dir, p.TestGoFiles)
-// 	hashFiles(h, p.Dir, p.XTestGoFiles)
-
-// 	hash := fmt.Sprintf("%x", h.Sum(nil))
-// 	p.pkgHash = hash
-// }
-
-// func hashFiles(h io.Writer, dir string, files []string) {
-// 	for _, file := range files {
-// 		fn := filepath.Join(dir, file)
-// 		f, err := os.Open(fn)
-// 		if err != nil {
-// 			fatalf("could not open file %v: %v\n", fn, err)
-// 		}
-
-// 		fmt.Fprintf(h, "file %s\n", file)
-// 		n, _ := io.Copy(h, f)
-// 		fmt.Fprintf(h, "%d bytes\n", n)
-
-// 		f.Close()
-// 	}
-// }
