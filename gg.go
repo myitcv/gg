@@ -1,21 +1,14 @@
 // Copyright (c) 2016 Paul Jolly <paul@myitcv.org.uk>, all rights reserved.
 // Use of this document is governed by a license found in the LICENSE document.
 
+// gg is a wrapper for go generate.
 package main // import "myitcv.io/gg"
-
-// gg is a wrapper for ``go generate''. More docs to follow
 
 import (
 	"flag"
 	"fmt"
-	"go/build"
 	"log"
-	"path"
-	"path/filepath"
 	"sort"
-	"strings"
-
-	"myitcv.io/gogenerate"
 )
 
 const (
@@ -29,206 +22,64 @@ var (
 	fDebug = flag.Bool("debug", false, "debug logging")
 )
 
-// All code basically derived from rsc.io/gt
+// When we move gg to be fully-cached based, we will need to load all deps via
+// go list so that we can derive a hash of their go files etc. At this point we
+// will need https://go-review.googlesource.com/c/go/+/112755 or similar to
+// have landed.
 
-func main() {
-	setupAndParseFlags("")
+var pkgs = make(map[string]*pkg)
 
-	loadConfig()
-
-	pkgs := make(map[string]*pkg)
-
-	resolve := func(ip string) *pkg {
-		p, ok := pkgs[ip]
-		if ok {
-			return p
-		}
-
-		p = &pkg{
-			ImportPath: ip,
-		}
-		pkgs[ip] = p
+func resolve(ip string) *pkg {
+	p, ok := pkgs[ip]
+	if ok {
 		return p
 	}
 
-	for pp := range readPkgs(flag.Args()) {
-		// we collapse down the test deps into the package deps
-		// because from a go generate perspective they are one and
-		// the same. We don't care for the files in the test
+	p = &pkg{
+		ImportPath: ip,
+	}
+	pkgs[ip] = p
+	return p
+}
 
-		p := resolve(pp.ImportPath)
-		p.Dir = pp.Dir
-		p.Name = pp.Name
-		p.inPkgSpec = true
+func loadPkgs(specs []string) pkgSet {
+	loaded := make(pkgSet)
 
-		ip := pp.ImportPath
-		if strings.HasSuffix(ip, ".test") {
-			ip = strings.TrimSuffix(ip, ".test")
-			rp := resolve(ip)
-			rp.testPkg = p
-			continue
-		}
-
-		p.deps = make(pkgSet)
-
-		for _, d := range pp.Deps {
-			p.deps[resolve(d)] = true
-		}
-
-		var gofiles []string
-		gofiles = append(gofiles, pp.GoFiles...)
-		gofiles = append(gofiles, pp.CgoFiles...)
-		gofiles = append(gofiles, pp.TestGoFiles...)
-		gofiles = append(gofiles, pp.XTestGoFiles...)
-
-		dirs := make(map[*pkg]map[string]bool)
-
-		for _, f := range gofiles {
-			check := func(line int, args []string) error {
-				// TODO add support for go run with package
-
-				cmd := args[0]
-				cmdPath, ok := config.baseCmds[cmd]
-				if !ok {
-					return fmt.Errorf("failed to resolve cmd %v", cmd)
-				}
-				cmdPkg := resolve(cmdPath)
-				pm, ok := dirs[cmdPkg]
-				if !ok {
-					pm = make(map[string]bool)
-					dirs[cmdPkg] = pm
-					cmdPkg.isTool = true
-				}
-
-				for i, a := range args {
-					if a == "--" {
-						// end of flags
-						break
-					}
-					const prefix = "-" + gogenerate.FlagOutPkgPrefix
-					if !strings.HasPrefix(a, prefix) {
-						continue
-					}
-
-					rem := strings.TrimPrefix(a, prefix)
-					if len(rem) == 0 || rem[0] == '=' || rem[0] == '-' {
-						return fmt.Errorf("bad arg %v", a)
-					}
-
-					var dirOrPkg string
-					var pkgPath string
-
-					for j := 1; j < len(rem); j++ {
-						if rem[j] == '=' {
-							dirOrPkg = rem[j+1:]
-							goto ResolveDirOrPkg
-						}
-					}
-
-					if i+1 == len(args) {
-						return fmt.Errorf("bad args %q", strings.Join(args, " "))
-					} else {
-						dirOrPkg = args[i+1]
-					}
-
-				ResolveDirOrPkg:
-					// TODO we could improve this logic
-					if filepath.IsAbs(dirOrPkg) {
-						bpkg, err := build.ImportDir(dirOrPkg, build.FindOnly)
-						if err != nil {
-							return fmt.Errorf("failed to resolve %v to a package: %v", dirOrPkg, err)
-						}
-						pkgPath = bpkg.ImportPath
-					} else {
-						bpkg, err := build.Import(dirOrPkg, p.Dir, build.FindOnly)
-						if err != nil {
-							return fmt.Errorf("failed to resolve %v in %v to a package: %v", dirOrPkg, p.Dir, err)
-						}
-						pkgPath = bpkg.ImportPath
-					}
-
-					pm[pkgPath] = true
-				}
-
-				return nil
-			}
-			if err := gogenerate.DirFunc(ip, p.Dir, f, check); err != nil {
-				fatalf("error checking %v: %v", filepath.Join(p.Dir, f), err)
-			}
-		}
-
-		for d, ods := range dirs {
-			if p.toolDeps == nil {
-				p.toolDeps = make(map[*pkg]map[string]bool)
-			}
-			p.toolDeps[d] = ods
-
-			// verify that none of the output directories are a Dep
-			for op := range ods {
-				if p.deps[resolve(op)] {
-					fatalf("package %v has directive %v that outputs to %v, but that is also a dep", p.ImportPath, d, op)
+	// when we are reloading packages, we will need to reload
+	// any rdeps that exist. The specs in this case will already
+	// have been fully resolved... so the lookup into pkgs is
+	// safe.
+	var rdeps []string
+	for _, s := range specs {
+		if ep, ok := pkgs[s]; ok {
+			ep.pending = nil
+			for rd := range ep.rdeps {
+				if rd.inPkgSpec {
+					rd.pending = nil
+					rdeps = append(rdeps, rd.ImportPath)
 				}
 			}
 		}
+	}
+	specs = append(specs, rdeps...)
 
-		for _, f := range gofiles {
-			gd, ok := gogenerate.FileIsGenerated(f)
-
-			// TODO improve hack for protobuf generated files
-			if !ok || strings.HasSuffix(f, ".pb.go") {
-				continue
-			}
-
-			found := false
-
-			for d := range dirs {
-				if path.Base(d.ImportPath) == gd {
-					found = true
-					break
-				}
-			}
-
-			// TODO implement delete if we are not in list mode
-			if !found {
-				fmt.Printf(">> will delete %v\n", filepath.Join(p.Dir, f))
-			}
-		}
-
-		// ====================
-		// DEBUG OUTPUT
-
-		pkgs[p.ImportPath] = p
-		fmt.Printf("%v\n", p.ImportPath)
-
-		var ds []string
-		for d := range p.deps {
-			ds = append(ds, d.ImportPath)
-		}
-		sort.Strings(ds)
-		for _, d := range ds {
-			fmt.Printf(" d - %v\n", d)
-		}
-		for t, dirs := range p.toolDeps {
-			ods := ""
-			if len(dirs) != 0 {
-				var odss []string
-				for od := range dirs {
-					odss = append(odss, od)
-				}
-				sort.Strings(odss)
-				ods = fmt.Sprintf(" [%v]", strings.Join(odss, ","))
-			}
-			fmt.Printf(" t - %v%v\n", t, ods)
+	var toolsToLoad []string
+	for t := range readPkgs(specs, loaded, false) {
+		if t.isTool && !t.inPkgSpec {
+			toolsToLoad = append(toolsToLoad, t.ImportPath)
 		}
 	}
 
-	// will all be tools
-	possRoots := make(pkgSet)
+	// skip scanning for any directives... these are external tools
+	readPkgs(toolsToLoad, loaded, true)
+
+	// now ensure we have loaded any tools that we not part of the original
+	// package spec
 
 	// populate rdeps
 	// TODO we don't need to fully populate this so look to trim at
 	// some point later
-	for _, p := range pkgs {
+	for p := range loaded {
 		p.pending = new(int)
 		for d := range p.deps {
 			if d.rdeps == nil {
@@ -256,30 +107,44 @@ func main() {
 			}
 			t.rdeps[p] = true
 		}
-		if p.isTool && !p.inPkgSpec {
-			// we need to install it and it we will have *p.pending == 0
-			// at this point
-			if *p.pending != 0 {
-				// TODO tighten up here
-				panic("oh dear")
-			}
-			*p.pending = 1
-		}
-		if p.isTool && (!p.inPkgSpec || *p.pending == 0) {
-			possRoots[p] = true
+		if p.isTool {
+			// we set a pending for the install
+			*p.pending++
 		}
 		if p.isTool {
 			fmt.Printf("Tool > %v\n", p)
 		}
 	}
 
-	// fmt.Printf("Possible roots: %v\n", strings.Join(importPaths(possRoots), ", "))
+	return loaded
+}
+
+func main() {
+	setupAndParseFlags("")
+	loadConfig()
+
+	var psSlice []*pkg
+	ps := loadPkgs(flag.Args())
+
+	possRoots := make(pkgSet)
+
+	for p := range ps {
+		psSlice = append(psSlice, p)
+		// we set pending on tools
+		if p.isTool {
+			fmt.Printf("%v %v\n", *p.pending, p)
+		}
+		if p.isTool && *p.pending == 1 {
+			possRoots[p] = true
+		}
+	}
+
+	sort.Slice(psSlice, func(i, j int) bool {
+		return psSlice[i].ImportPath < psSlice[j].ImportPath
+	})
 
 	for pr := range possRoots {
 		fmt.Printf("Poss root: %v\n", pr)
-		// for rd := range pr.rdeps {
-		// 	fmt.Printf(" - %v\n", rd)
-		// }
 	}
 
 	var work []*pkg
@@ -298,23 +163,20 @@ func main() {
 		}
 		for rd := range h.rdeps {
 			*rd.pending--
-			if *rd.pending == 0 {
+			if *rd.pending == 0 || (rd.isTool && *rd.pending == 1) {
 				work = append(work, rd)
 			}
 		}
 	}
-	// 	if h.done {
-	// 		continue
-	// 	}
 
-	// 	h.done = true
+	for _, p := range psSlice {
+		if p.isTestPkg {
+			continue
+		}
+		p.rehash()
+		fmt.Printf("%#x %v\n", p.hash, p)
+	}
 
-	// 	for rd := range h.rdeps {
-	// 		if rd.done {
-	// 			continue
-	// 		}
-	// 	}
-	// }
 }
 
 func importPaths(ps pkgSet) []string {
