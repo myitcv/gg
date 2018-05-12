@@ -67,7 +67,7 @@ type pkg struct {
 	inPkgSpec bool
 
 	isTool  bool
-	pending *int
+	pending map[*pkg]bool
 
 	hashVal []byte
 }
@@ -121,6 +121,20 @@ func (p *pkg) hashFiles(h hash.Hash, files []string) {
 			fatalf("failed to hash %v: %v", path, err)
 		}
 	}
+}
+
+type hashRes map[*pkg]string
+
+func (p *pkg) snap() hashRes {
+	res := make(hashRes)
+	res[p] = string(p.hash())
+	for _, outPkgMap := range p.toolDeps {
+		for op := range outPkgMap {
+			res[op] = string(op.hash())
+		}
+	}
+	return res
+
 }
 
 type pkgSet map[*pkg]bool
