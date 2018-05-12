@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"sync"
 )
 
 const (
@@ -72,11 +73,10 @@ func loadPkgs(specs []string) pkgSet {
 		}
 	}
 
-	// skip scanning for any directives... these are external tools
-	readPkgs(toolsAndOutPkgs, loaded, true, true)
-
 	// now ensure we have loaded any tools that we not part of the original
 	// package spec
+	// skip scanning for any directives... these are external tools
+	readPkgs(toolsAndOutPkgs, loaded, true, true)
 
 	// populate rdeps
 	// TODO we don't need to fully populate this so look to trim at
@@ -144,35 +144,145 @@ func main() {
 		work = append(work, pr)
 	}
 
-	var h *pkg
-
-	// TODO make this concurrent where we can; i.e. go install steps
-	// and go generate steps where there are disjoint output packages
 	for len(work) > 0 {
-		h, work = work[0], work[1:]
-		if h.isTool {
-			cmd := exec.Command("go", "install", h.ImportPath)
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				fatalf("failed to run %v: %v\n%s", strings.Join(cmd.Args, " "), err, out)
+		outPkgs := make(map[*pkg]bool)
+		var is, gs []*pkg
+		var next []*pkg
+
+	WorkScan:
+		for _, w := range work {
+			if w.isTool {
+				is = append(is, w)
+				continue WorkScan
+			} else {
+				// we are searching for clashes _between_ packages not intra
+				// package (because that clash is just fine - no race condition)
+				if outPkgs[w] {
+					// clash
+					goto NoWork
+				}
+				for _, ods := range w.toolDeps {
+					for od := range ods {
+						if outPkgs[od] {
+							// clash
+							goto NoWork
+						}
+					}
+				}
+				gs = append(gs, w)
+				// no clashes
+				outPkgs[w] = true
+				for _, ods := range w.toolDeps {
+					for od := range ods {
+						outPkgs[od] = true
+					}
+				}
+				continue WorkScan
 			}
-			fmt.Printf("%v\n", strings.Join(cmd.Args, " "))
-		} else {
-			// type hashRes map[string]string
-			// hash := func() hashRes {
-			// 	res := make(hashRes)
-			// 	res[h.ImportPath] = string(h.hash())
-			// 	for _, outPkgMap := range h.toolDeps {
-			// 		for op := range outPkgMap {
-			// 		}
-			// 	}
-			// }
-			fmt.Printf("go generate %v\n", h)
+
+		NoWork:
+			next = append(next, w)
 		}
-		for rd := range h.rdeps {
-			*rd.pending--
-			if *rd.pending == 0 {
-				work = append(work, rd)
+
+		work = next
+
+		var iwg sync.WaitGroup
+		var gwg sync.WaitGroup
+
+		// the is (installs) can proceed concurrently, as can the gs (generates),
+		// because we know in the case of the latter that their output packages
+		// are mutually exclusive
+		if len(is) > 0 {
+			for _, i := range is {
+				i := i
+				iwg.Add(1)
+				go func() {
+					defer func() {
+						iwg.Done()
+					}()
+					cmd := exec.Command("go", "install", i.ImportPath)
+					out, err := cmd.CombinedOutput()
+					if err != nil {
+						fatalf("failed to run %v: %v\n%s", strings.Join(cmd.Args, " "), err, out)
+					}
+					fmt.Printf("%v\n", strings.Join(cmd.Args, " "))
+				}()
+			}
+		}
+		if len(gs) > 0 {
+			for _, g := range gs {
+				g := g
+				gwg.Add(1)
+				go func() {
+					defer func() {
+						gwg.Done()
+					}()
+					type hashRes map[*pkg]string
+					hash := func() hashRes {
+						res := make(hashRes)
+						res[g] = string(g.hash())
+						for _, outPkgMap := range g.toolDeps {
+							for op := range outPkgMap {
+								res[op] = string(op.hash())
+							}
+						}
+						return res
+					}
+					i := 0
+					pre := hash()
+
+				GoGenerate:
+					for {
+						i++
+						// reload packages
+						toReload := []string{g.ImportPath}
+						for _, ods := range g.toolDeps {
+							for od := range ods {
+								toReload = append(toReload, od.ImportPath)
+							}
+						}
+
+						cmd := exec.Command("go", "generate", g.ImportPath)
+						out, err := cmd.CombinedOutput()
+						if err != nil {
+							fatalf("failed to run %v: %v\n%s", strings.Join(cmd.Args, " "), err, out)
+						}
+
+						fmt.Printf("%v (iteration %v)\n", strings.Join(cmd.Args, " "), i)
+
+						loadPkgs(toReload)
+
+						post := hash()
+						if len(pre) != len(post) {
+							fatalf("bad hashing lengths: pre %v vs post %v?", len(pre), len(post))
+						}
+						for prep, preh := range pre {
+							posth, ok := post[prep]
+							if !ok {
+								fatalf("bad hashing: pre had %v but post didn't", prep)
+							}
+							if preh != posth {
+								pre = post
+								continue GoGenerate
+							}
+						}
+						break
+					}
+				}()
+			}
+		}
+
+		iwg.Wait()
+		gwg.Wait()
+
+		for _, p := range append(is, gs...) {
+			fmt.Printf("are we pending? %v %v\n", *p.pending, p)
+			for rd := range p.rdeps {
+				*rd.pending--
+				fmt.Printf(" - checking rdep (%v) %v -> %v\n", *rd.pending, p, rd)
+				if *rd.pending == 0 {
+					work = append(work, rd)
+				}
 			}
 		}
 	}
