@@ -66,14 +66,60 @@ type pkg struct {
 
 	inPkgSpec bool
 
-	isTool  bool
-	pending map[*pkg]bool
+	isTool     bool
+	pendingVal map[*pkg]bool
 
 	hashVal []byte
 }
 
 func (p *pkg) String() string {
 	return p.ImportPath
+}
+
+func (p *pkg) resetPending() {
+	p.pendingVal = nil
+	p.pending()
+}
+
+func (p *pkg) pending() bool {
+	if p.pendingVal == nil {
+		p.pendingVal = make(pkgSet)
+		for d := range p.deps {
+			if d.pending() {
+				p.pendingVal[d] = true
+			}
+		}
+		for t := range p.toolDeps {
+			if t.pending() {
+				p.pendingVal[t] = true
+			}
+		}
+		if p.isTool || len(p.pendingVal) > 0 || len(p.toolDeps) > 0 {
+			// the install/generate step
+			p.pendingVal[p] = true
+		}
+	}
+
+	return len(p.pendingVal) > 0
+}
+
+func (p *pkg) ready() bool {
+	switch len(p.pendingVal) {
+	case 0:
+		return true
+	case 1:
+		if p.pendingVal[p] {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *pkg) donePending(v *pkg) {
+	if _, ok := p.pendingVal[v]; !ok {
+		fatalf("tried to complete pending for %v in %v but did not exist", v, p)
+	}
+	delete(p.pendingVal, v)
 }
 
 func (p *pkg) hash() []byte {
@@ -110,7 +156,10 @@ func (p *pkg) hash() []byte {
 
 func (p *pkg) hashFiles(h hash.Hash, files []string) {
 	for _, f := range files {
-		path := filepath.Join(p.Dir, f)
+		path := f
+		if !filepath.IsAbs(f) {
+			path = filepath.Join(p.Dir, f)
+		}
 		fi, err := os.Open(path)
 		if err != nil {
 			fatalf("failed to open %v: %v", path, err)
@@ -125,6 +174,24 @@ func (p *pkg) hashFiles(h hash.Hash, files []string) {
 
 type hashRes map[*pkg]string
 
+func (h hashRes) equals(v hashRes) (bool, error) {
+	if len(h) != len(v) {
+		return false, fmt.Errorf("hashRes length mismatch")
+	}
+
+	for hk, hv := range h {
+		vv, ok := v[hk]
+		if !ok {
+			return false, fmt.Errorf("hashRes key mistmatch")
+		}
+		if hv != vv {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
 func (p *pkg) snap() hashRes {
 	res := make(hashRes)
 	res[p] = string(p.hash())
@@ -134,17 +201,31 @@ func (p *pkg) snap() hashRes {
 		}
 	}
 	return res
+}
 
+func (p *pkg) zeroSnap() hashRes {
+	res := make(hashRes)
+	res[p] = ""
+	for _, outPkgMap := range p.toolDeps {
+		for op := range outPkgMap {
+			res[op] = ""
+		}
+	}
+	return res
 }
 
 type pkgSet map[*pkg]bool
 
-// returns the tools and output packages detected during scanning of the loaded
-// packages' directives. These might need a second load
-func readPkgs(pkgs []string, loaded pkgSet, dontScan bool, notInPkgSpec bool) pkgSet {
+// returns the ordered pkg load list and a list of import paths of tools and
+// output packages detected during scanning of the loaded packages' directives
+// that were not part of the original package spec. These might need a second
+// load
+func readPkgs(pkgs []string, dontScan bool, notInPkgSpec bool) ([]*pkg, []string) {
 	if len(pkgs) == 0 {
-		return nil
+		return nil, nil
 	}
+
+	var loadOrder []*pkg
 
 	toolsAndOutPkgs := make(pkgSet)
 	res := make(chan *Package)
@@ -187,7 +268,7 @@ func readPkgs(pkgs []string, loaded pkgSet, dontScan bool, notInPkgSpec bool) pk
 		p.CgoFiles = pp.CgoFiles
 
 		p.inPkgSpec = !notInPkgSpec
-		loaded[p] = true
+		loadOrder = append(loadOrder, p)
 
 		// invalidate any existing hash
 		p.hashVal = nil
@@ -360,5 +441,12 @@ func readPkgs(pkgs []string, loaded pkgSet, dontScan bool, notInPkgSpec bool) pk
 		// }
 	}
 
-	return toolsAndOutPkgs
+	var ips []string
+	for t := range toolsAndOutPkgs {
+		if !t.inPkgSpec {
+			ips = append(ips, t.ImportPath)
+		}
+	}
+
+	return loadOrder, ips
 }

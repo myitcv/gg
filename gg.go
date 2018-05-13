@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
-	"sort"
 	"strings"
 	"sync"
 )
@@ -46,26 +45,28 @@ func resolve(ip string) *pkg {
 }
 
 func loadPkgs(specs []string) pkgSet {
-	loaded := make(pkgSet)
-
-
-	var toolsAndOutPkgs []string
-	for t := range readPkgs(specs, loaded, false, false) {
-		if !t.inPkgSpec {
-			toolsAndOutPkgs = append(toolsAndOutPkgs, t.ImportPath)
-		}
-	}
+	loadOrder, toolsAndOutPkgs := readPkgs(specs, false, false)
 
 	// now ensure we have loaded any tools that we not part of the original
 	// package spec
 	// skip scanning for any directives... these are external tools
-	readPkgs(toolsAndOutPkgs, loaded, true, true)
+	toolLoadOrder, _ := readPkgs(toolsAndOutPkgs, true, true)
+
+	loadOrder = append(toolLoadOrder, loadOrder...)
+
+	loaded := make(pkgSet)
+	for _, l := range loadOrder {
+		loaded[l] = true
+	}
 
 	// populate rdeps
 	// TODO we don't need to fully populate this so look to trim at
 	// some point later
-	for p := range loaded {
-		p.pending = make(map[*pkg]bool)
+	for _, p := range loadOrder {
+		if p.inPkgSpec {
+			p.resetPending()
+		}
+		p.rdeps = make(pkgSet)
 		if !p.inPkgSpec {
 			continue
 		}
@@ -74,26 +75,12 @@ func loadPkgs(specs []string) pkgSet {
 				d.rdeps = make(pkgSet)
 			}
 			d.rdeps[p] = true
-			if d.pending != nil {
-				if len(d.pending) > 0 {
-					p.pending[d] = true
-				}
-			} else if len(d.toolDeps) > 0 {
-				p.pending[d] = true
-			}
 		}
 		for t := range p.toolDeps {
 			if t.rdeps == nil {
 				t.rdeps = make(pkgSet)
 			}
 			t.rdeps[p] = true
-			if t.pending != nil {
-				if len(t.pending) > 0 {
-					p.pending[t] = true
-				}
-			} else {
-				p.pending[t] = true
-			}
 		}
 	}
 
@@ -104,25 +91,15 @@ func main() {
 	setupAndParseFlags("")
 	loadConfig()
 
-	var psSlice []*pkg
 	ps := loadPkgs(flag.Args())
 
 	possRoots := make(pkgSet)
 
 	for p := range ps {
-		psSlice = append(psSlice, p)
-		// we set pending on tools
-		if p.isTool {
-			fmt.Printf("%v %v\n", len(p.pending), p)
-		}
-		if p.isTool && len(p.pending) == 0 {
+		if p.isTool && p.ready() {
 			possRoots[p] = true
 		}
 	}
-
-	sort.Slice(psSlice, func(i, j int) bool {
-		return psSlice[i].ImportPath < psSlice[j].ImportPath
-	})
 
 	for pr := range possRoots {
 		fmt.Printf("Poss root: %v\n", pr)
@@ -136,7 +113,7 @@ func main() {
 	for len(work) > 0 {
 		outPkgs := make(map[*pkg]bool)
 		var is, gs []*pkg
-		var next []*pkg
+		var rem []*pkg
 
 	WorkScan:
 		for _, w := range work {
@@ -170,10 +147,14 @@ func main() {
 			}
 
 		NoWork:
-			next = append(next, w)
+			rem = append(rem, w)
 		}
 
-		work = next
+		fmt.Printf("is: %#v\n", importPaths(is))
+		fmt.Printf("gs: %#v\n", importPaths(gs))
+		fmt.Printf("rem: %#v\n", importPaths(rem))
+
+		work = rem
 
 		var iwg sync.WaitGroup
 
@@ -201,6 +182,7 @@ func main() {
 			// when we are done with this block of work we need to reload
 			// rdeps of the output packages to ensure they are still current
 			rdeps := make(pkgSet)
+
 			done := make(chan *pkg)
 
 			type pkgState struct {
@@ -217,42 +199,41 @@ func main() {
 					rdeps[rd] = true
 				}
 
-				// TODO maybe creating post isn't necessary
-				post := make(hashRes)
-				post[g] = ""
-				for _, outPkgMap := range g.toolDeps {
-					for op := range outPkgMap {
-						post[op] = ""
-					}
-				}
 				state[g] = &pkgState{
-					pre: g.snap(),
-					post: post,
+					pre:  g.snap(),
+					post: g.zeroSnap(),
 				}
 			}
 
-		GoGenerate:
 			for {
 				checkCount := 0
-				for g := range state {
+				for g, gs := range state {
 					g := g
 
-					if g.pending {
+					// TODO
+					// we need to check that we can still proceed, i.e. we haven't "grown"
+					// a new dependency that isn't ready
+
+					if gs.pending {
 						continue
 					}
 
-					if g.pre != g.post {
-						g.pending = true
+					if hashEquals, err := gs.pre.equals(gs.post); err != nil {
+						fatalf("failed to compare hashes for %v: %v", g, err)
+					} else if !hashEquals {
+						gs.pre = gs.post
+						gs.pending = true
+						gs.count++
 						// fire off work
 						go func() {
-								cmd := exec.Command("go", "generate", g.ImportPath)
-								out, err := cmd.CombinedOutput()
-								if err != nil {
-									fatalf("failed to run %v: %v\n%s", strings.Join(cmd.Args, " "), err, out)
-								}
+							cmd := exec.Command("go", "generate", g.ImportPath)
+							out, err := cmd.CombinedOutput()
+							if err != nil {
+								fatalf("failed to run %v: %v\n%s", strings.Join(cmd.Args, " "), err, out)
+							}
 
-								fmt.Printf("%v (iteration %v)\n", strings.Join(cmd.Args, " "), i)
-								done <- g
+							fmt.Printf("%v (iteration %v)\n", strings.Join(cmd.Args, " "), gs.count)
+							done <- g
 						}()
 					} else {
 						checkCount++
@@ -264,8 +245,8 @@ func main() {
 				}
 
 				select {
-				case g <- done:
-					g.pending = false
+				case g := <-done:
+					state[g].pending = false
 
 					// reload packages
 					toReload := []string{g.ImportPath}
@@ -278,67 +259,50 @@ func main() {
 					loadPkgs(toReload)
 
 					state[g].post = g.snap()
-
-						go func() {
-							defer func() {
-								done <- g
-							}()
-							i := 0
-
-
-
-
-								post := hash()
-								if len(pre) != len(post) {
-									fatalf("bad hashing lengths: pre %v vs post %v?", len(pre), len(post))
-								}
-								for prep, preh := range pre {
-									posth, ok := post[prep]
-									if !ok {
-										fatalf("bad hashing: pre had %v but post didn't", prep)
-									}
-									if preh != posth {
-										pre = post
-										continue GoGenerate
-									}
-								}
-								break
-							}
-						}()
-					}
-
-					if !didWork {
-						break GoGenerate
-					}
 				}
+			}
 
+			// now reload the rdeps
+			var toReload []string
+			for rd := range rdeps {
+				toReload = append(toReload, rd.ImportPath)
+			}
+			loadPkgs(toReload)
+		}
 
 		iwg.Wait()
 
 		for _, p := range append(is, gs...) {
-			if len(p.pending) > 0 {
-				fmt.Printf("%v is still pending on:\n", p)
-				for pp := range p.pending {
+			if !p.ready() {
+				for pp := range p.pendingVal {
 					fmt.Printf(" + %v\n", pp)
 				}
+				fatalf("%v is still pending on:\n", p)
 			}
+			p.donePending(p)
+			fmt.Printf("%v marked as complete\n", p)
 			for rd := range p.rdeps {
-				delete(rd.pending, p)
-				fmt.Printf(" - checking rdep (%v) %v -> %v\n", len(rd.pending), p, rd)
-				if len(rd.pending) == 0 {
+				rd.donePending(p)
+				if rd.ready() {
+					fmt.Printf("adding work %v\n", rd)
 					work = append(work, rd)
+				} else {
+					fmt.Printf(" - %v not ready (%v)\n", rd, len(rd.pendingVal))
+					for rrd := range rd.pendingVal {
+						fmt.Printf("   - %v\n", rrd)
+					}
 				}
 			}
 		}
 	}
+}
 
-	for _, p := range psSlice {
-		if p.isTestPkg {
-			continue
-		}
-		fmt.Printf("%#x %v\n", p.hash(), p)
+func importPaths(ps []*pkg) []string {
+	var res []string
+	for _, p := range ps {
+		res = append(res, p.ImportPath)
 	}
-
+	return res
 }
 
 func xlog(args ...interface{}) {
