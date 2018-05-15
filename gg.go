@@ -47,9 +47,16 @@ func resolve(ip string) *pkg {
 func loadPkgs(specs []string) pkgSet {
 	loadOrder, toolsAndOutPkgs := readPkgs(specs, false, false)
 
-	// now ensure we have loaded any tools that we not part of the original
-	// package spec
-	// skip scanning for any directives... these are external tools
+	// now ensure we have loaded any tools that were not part of the original
+	// package spec; skipping loading them if we have previously loaded them.
+	// We skip scanning for any directives... these are external tools
+	var toolAndOutSpecs []string
+	for _, ip := range toolsAndOutPkgs {
+		if p := pkgs[ip]; p.pendingVal == nil {
+			toolAndOutSpecs = append(toolAndOutSpecs, ip)
+		}
+	}
+
 	toolLoadOrder, _ := readPkgs(toolsAndOutPkgs, true, true)
 
 	loadOrder = append(toolLoadOrder, loadOrder...)
@@ -57,16 +64,16 @@ func loadPkgs(specs []string) pkgSet {
 	loaded := make(pkgSet)
 	for _, l := range loadOrder {
 		loaded[l] = true
+		if l.inPkgSpec {
+			l.pendingVal = nil
+		}
 	}
 
 	// populate rdeps
 	// TODO we don't need to fully populate this so look to trim at
 	// some point later
 	for _, p := range loadOrder {
-		if p.inPkgSpec {
-			p.resetPending()
-		}
-		p.rdeps = make(pkgSet)
+		p.pending()
 		if !p.inPkgSpec {
 			continue
 		}
@@ -83,6 +90,38 @@ func loadPkgs(specs []string) pkgSet {
 			t.rdeps[p] = true
 		}
 	}
+
+	// for _, p := range loadOrder {
+	// 	p.pending()
+	// 	fmt.Printf(">> %v (%v)\n", p.ImportPath, p.pending())
+
+	// 	var ds []string
+	// 	for d := range p.deps {
+	// 		if !d.inPkgSpec || !d.pending() {
+	// 			continue
+	// 		}
+	// 		ds = append(ds, d.ImportPath)
+	// 	}
+	// 	sort.Strings(ds)
+	// 	for _, d := range ds {
+	// 		fmt.Printf(" d - %v\n", d)
+	// 	}
+	// 	for t, dirs := range p.toolDeps {
+	// 		if !t.pending() {
+	// 			continue
+	// 		}
+	// 		ods := ""
+	// 		if len(dirs) != 0 {
+	// 			var odss []string
+	// 			for od := range dirs {
+	// 				odss = append(odss, od.ImportPath)
+	// 			}
+	// 			sort.Strings(odss)
+	// 			ods = fmt.Sprintf(" [%v]", strings.Join(odss, ","))
+	// 		}
+	// 		fmt.Printf(" t - %v%v\n", t, ods)
+	// 	}
+	// }
 
 	return loaded
 }
@@ -272,24 +311,39 @@ func main() {
 
 		iwg.Wait()
 
+		var possWork []*pkg
+
 		for _, p := range append(is, gs...) {
+			p.donePending(p)
 			if !p.ready() {
 				for pp := range p.pendingVal {
 					fmt.Printf(" + %v\n", pp)
 				}
 				fatalf("%v is still pending on:\n", p)
 			}
-			p.donePending(p)
+
 			fmt.Printf("%v marked as complete\n", p)
+
 			for rd := range p.rdeps {
 				rd.donePending(p)
 				if rd.ready() {
-					fmt.Printf("adding work %v\n", rd)
-					work = append(work, rd)
-				} else {
-					fmt.Printf(" - %v not ready (%v)\n", rd, len(rd.pendingVal))
-					for rrd := range rd.pendingVal {
-						fmt.Printf("   - %v\n", rrd)
+					possWork = append(possWork, rd)
+				}
+			}
+		}
+
+		var pw *pkg
+		for len(possWork) > 0 {
+			pw, possWork = possWork[0], possWork[1:]
+			if pw.isTool || len(pw.toolDeps) > 0 {
+				work = append(work, pw)
+			} else {
+				// this is a package which exists as a transitive dep
+				pw.donePending(pw)
+				for rd := range pw.rdeps {
+					rd.donePending(pw)
+					if rd.ready() {
+						possWork = append(possWork, rd)
 					}
 				}
 			}

@@ -76,11 +76,6 @@ func (p *pkg) String() string {
 	return p.ImportPath
 }
 
-func (p *pkg) resetPending() {
-	p.pendingVal = nil
-	p.pending()
-}
-
 func (p *pkg) pending() bool {
 	if p.pendingVal == nil {
 		p.pendingVal = make(pkgSet)
@@ -94,7 +89,7 @@ func (p *pkg) pending() bool {
 				p.pendingVal[t] = true
 			}
 		}
-		if p.isTool || len(p.pendingVal) > 0 || len(p.toolDeps) > 0 {
+		if p.isTool || len(p.toolDeps) > 0 || len(p.pendingVal) > 0 {
 			// the install/generate step
 			p.pendingVal[p] = true
 		}
@@ -104,6 +99,7 @@ func (p *pkg) pending() bool {
 }
 
 func (p *pkg) ready() bool {
+	p.pending()
 	switch len(p.pendingVal) {
 	case 0:
 		return true
@@ -117,6 +113,13 @@ func (p *pkg) ready() bool {
 
 func (p *pkg) donePending(v *pkg) {
 	if _, ok := p.pendingVal[v]; !ok {
+		if p == v && !p.isTool && len(p.toolDeps) == 0 {
+			return
+		}
+		fmt.Printf("we had:\n")
+		for d := range p.pendingVal {
+			fmt.Printf(" => %v\n", d)
+		}
 		fatalf("tried to complete pending for %v in %v but did not exist", v, p)
 	}
 	delete(p.pendingVal, v)
@@ -417,28 +420,10 @@ func readPkgs(pkgs []string, dontScan bool, notInPkgSpec bool) ([]*pkg, []string
 		// ====================
 		// DEBUG OUTPUT
 
-		// fmt.Printf("%v\n", p.ImportPath)
+		// if pp.ImportPath != "modelogiq.com/g/charting/chcore" {
+		// 	continue
+		// }
 
-		// var ds []string
-		// for d := range p.deps {
-		// 	ds = append(ds, d.ImportPath)
-		// }
-		// sort.Strings(ds)
-		// for _, d := range ds {
-		// 	fmt.Printf(" d - %v\n", d)
-		// }
-		// for t, dirs := range p.toolDeps {
-		// 	ods := ""
-		// 	if len(dirs) != 0 {
-		// 		var odss []string
-		// 		for od := range dirs {
-		// 			odss = append(odss, od.ImportPath)
-		// 		}
-		// 		sort.Strings(odss)
-		// 		ods = fmt.Sprintf(" [%v]", strings.Join(odss, ","))
-		// 	}
-		// 	fmt.Printf(" t - %v%v\n", t, ods)
-		// }
 	}
 
 	var ips []string
