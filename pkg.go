@@ -136,8 +136,9 @@ type pkg struct {
 	testPkg   *pkg
 	isTestPkg bool
 
-	deps     map[*pkg]bool
-	toolDeps map[*pkg]map[*pkg]bool
+	deps        map[*pkg]bool
+	toolDeps    map[*pkg]map[*pkg]bool
+	nonToolDeps map[string]bool
 
 	rdeps map[*pkg]bool
 
@@ -166,7 +167,7 @@ func (p *pkg) pending() bool {
 				p.pendingVal[t] = true
 			}
 		}
-		if p.isTool || len(p.toolDeps) > 0 || len(p.pendingVal) > 0 {
+		if p.isTool || len(p.toolDeps) > 0 || len(p.pendingVal) > 0 || len(p.nonToolDeps) > 0 {
 			// the install/generate step
 			p.pendingVal[p] = true
 		}
@@ -190,12 +191,12 @@ func (p *pkg) ready() bool {
 
 func (p *pkg) donePending(v *pkg) {
 	if _, ok := p.pendingVal[v]; !ok {
-		if p == v && !p.isTool && len(p.toolDeps) == 0 {
+		if p == v && !p.isTool && len(p.toolDeps) == 0 && len(p.nonToolDeps) == 0 {
 			return
 		}
-		fmt.Printf("we had:\n")
+		debugf("we had:\n")
 		for d := range p.pendingVal {
-			fmt.Printf(" => %v\n", d)
+			debugf(" => %v\n", d)
 		}
 		fatalf("tried to complete pending for %v in %v but did not exist", v, p)
 	}
@@ -381,6 +382,7 @@ func readPkgs(pkgs []string, dontScan bool, notInPkgSpec bool) ([]*pkg, []string
 		gofiles = append(gofiles, pp.XTestGoFiles...)
 
 		dirs := make(map[*pkg]map[*pkg]bool)
+		nonToolDirs := make(map[string]bool)
 
 		for _, f := range gofiles {
 			check := func(line int, args []string) error {
@@ -389,6 +391,11 @@ func readPkgs(pkgs []string, dontScan bool, notInPkgSpec bool) ([]*pkg, []string
 				cmd := args[0]
 				cmdPath, ok := config.baseCmds[cmd]
 				if !ok {
+					// check if it's a nonTool
+					if _, ok := config.nonCmds[cmd]; ok {
+						nonToolDirs[cmd] = true
+						return nil
+					}
 					return fmt.Errorf("failed to resolve cmd %v", cmd)
 				}
 				cmdPkg := resolve(cmdPath)
@@ -471,6 +478,13 @@ func readPkgs(pkgs []string, dontScan bool, notInPkgSpec bool) ([]*pkg, []string
 					fatalf("package %v has directive %v that outputs to %v, but that is also a dep", p.ImportPath, d, op)
 				}
 			}
+		}
+
+		for cmd := range nonToolDirs {
+			if p.nonToolDeps == nil {
+				p.nonToolDeps = make(map[string]bool)
+			}
+			p.nonToolDeps[cmd] = true
 		}
 	}
 

@@ -6,7 +6,6 @@ package main // import "myitcv.io/gg"
 
 import (
 	"flag"
-	"fmt"
 	"os/exec"
 	"strings"
 	"sync"
@@ -184,7 +183,6 @@ func main() {
 								fatalf("failed to run %v: %v\n%s", strings.Join(cmd.Args, " "), err, out)
 							}
 
-							fmt.Print(string(out))
 							verbosef("%v iteration %v (%v)\n", strings.Join(cmd.Args, " "), gs.count, time.Now().Sub(pre).Seconds()*1000)
 							done <- g
 						}()
@@ -238,7 +236,7 @@ func main() {
 			}
 			if !p.ready() {
 				for pp := range p.pendingVal {
-					fmt.Printf(" + %v\n", pp)
+					debugf(" + %v\n", pp)
 				}
 				fatalf("%v is still pending on:\n", p)
 			}
@@ -289,7 +287,7 @@ func main() {
 
 	for _, p := range pkgs {
 		if !p.ready() {
-			fmt.Printf("%v is not ready\n", p)
+			debugf("%v is not ready\n", p)
 		}
 	}
 }

@@ -12,9 +12,12 @@ const (
 )
 
 type Config struct {
-	Cmds     []string
+	Cmds    []string
+	NonCmds []string
+
 	cmds     map[string]struct{}
 	baseCmds map[string]string
+	nonCmds  map[string]struct{}
 }
 
 var config Config
@@ -63,6 +66,7 @@ func loadConfig() {
 
 	config.cmds = make(map[string]struct{})
 	config.baseCmds = make(map[string]string)
+	config.nonCmds = make(map[string]struct{})
 
 	for _, v := range config.Cmds {
 		b := filepath.Base(v)
@@ -70,8 +74,17 @@ func loadConfig() {
 		config.baseCmds[b] = v
 	}
 
+	for _, v := range config.NonCmds {
+		config.nonCmds[v] = struct{}{}
+	}
+
 	config.Cmds = nil
 	for k := range config.cmds {
 		config.Cmds = append(config.Cmds, k)
+	}
+
+	config.NonCmds = nil
+	for k := range config.nonCmds {
+		config.NonCmds = append(config.NonCmds, k)
 	}
 }

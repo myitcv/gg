@@ -54,7 +54,7 @@ func testgg(t *testing.T, dir string) *testggData {
 		panic(fmt.Errorf("failed to get cwd: %v", err))
 	}
 
-	td := filepath.Join(wd, "testdata", "test.0001")
+	td := filepath.Join(wd, "testdata", dir)
 
 	res := &testggData{
 		t:      t,
@@ -141,6 +141,7 @@ func (tg *testggData) run(args ...string) {
 	if err != nil {
 		tg.t.Fatalf("failed to run %v: %v\n%s", strings.Join(cmd.Args, " "), err, out)
 	}
+	fmt.Printf("%s\n", out)
 }
 
 func (tg *testggData) ensure(dir string) {
