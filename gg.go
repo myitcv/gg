@@ -294,7 +294,7 @@ func cmdList(pNames []string) []string {
 				}
 			}
 
-			gogenerate.DirFunc(pName, f, visitDir)
+			gogenerate.DirFunc(pName, pkg.Dir, f, visitDir)
 		}
 
 		removed := false
