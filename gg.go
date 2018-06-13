@@ -183,7 +183,7 @@ func main() {
 								fatalf("failed to run %v: %v\n%s", strings.Join(cmd.Args, " "), err, out)
 							}
 
-							verbosef("%v iteration %v (%v)\n", strings.Join(cmd.Args, " "), gs.count, time.Now().Sub(pre).Seconds()*1000)
+							verbosef("%v iteration %v (%.2fms)\n", strings.Join(cmd.Args, " "), gs.count, time.Now().Sub(pre).Seconds()*1000)
 							done <- g
 						}()
 					} else {
@@ -192,7 +192,7 @@ func main() {
 				}
 
 				if checkCount == len(state) {
-					verbosef("go generate loop completed (%v)\n", time.Now().Sub(gpre).Seconds()*1000)
+					verbosef("go generate loop completed (%.2fms)\n", time.Now().Sub(gpre).Seconds()*1000)
 					break
 				}
 
